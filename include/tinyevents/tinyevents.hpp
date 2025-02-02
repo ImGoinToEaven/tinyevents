@@ -4,16 +4,18 @@
 #include <list>
 #include <set>
 #include <map>
+#include <vector>
 #include <typeindex>
 #include <utility>
+#include <algorithm>
+#include <cstdint>
+#include <algorithm>
 
 namespace tinyevents
 {
     class Token;
 
     class Dispatcher {
-        using ListenerHandle = std::uint64_t;
-        using Listeners = std::map<ListenerHandle, std::function<void(const void *)>>;
     public:
         Dispatcher() = default;
         Dispatcher(Dispatcher &&) noexcept = default;
@@ -21,125 +23,112 @@ namespace tinyevents
         Dispatcher &operator=(Dispatcher &&) noexcept = default;
 
         template<typename T>
-        std::uint64_t listen(const std::function<void(const T &)> &listener) {
-            auto& listeners = listenersByType[std::type_index(typeid(T))];
-            const auto listenerHandle = ListenerHandle{nextListenerId++};
-
-            listeners[listenerHandle] = [listener](const auto &msg) {
-                const T *concreteMessage = static_cast<const T *>(msg);
-                listener(*concreteMessage);
+        std::uint64_t listen(const std::function<void(const T &)> &listener, int priority = 0) {
+            auto &listeners = listenersByType[std::type_index(typeid(T))];
+            const auto listenerHandle = nextListenerId++;
+            ListenerEntry entry;
+            entry.handle = listenerHandle;
+            entry.priority = priority;
+            entry.callback = [listener](const void *msg) {
+                listener(*static_cast<const T *>(msg));
             };
+            auto it = std::find_if(listeners.begin(), listeners.end(), [priority](const ListenerEntry &e) {
+                return e.priority < priority;
+            });
+            listeners.insert(it, entry);
             return listenerHandle;
         }
 
         template<typename T>
-        std::uint64_t listenOnce(const std::function<void(const T &)> &listener) {
+        std::uint64_t listenOnce(const std::function<void(const T &)> &listener, int priority = 0) {
             const auto listenerId = nextListenerId;
             return listen<T>([this, listenerId, listener](const T &msg) {
-                ListenerHandle handle{listenerId};
-                listenersScheduledForRemoval.emplace(handle); // Fix for nested listenOnce
+                listenersScheduledForRemoval.insert(listenerId);
                 listener(msg);
-                listenersScheduledForRemoval.erase(handle);
-                this->remove(handle);
-            });
+                listenersScheduledForRemoval.erase(listenerId);
+                this->remove(listenerId);
+            }, priority);
         }
 
         template<typename T>
         void dispatch(const T &msg) {
-            const auto &listenersIter = listenersByType.find(std::type_index(typeid(T)));
-            if (listenersIter == listenersByType.end()) {
-                return; // No listeners for this type of message
-            }
-
-            const auto& [msgType, listeners] = *listenersIter;
-
-            // Cache handles to avoid iterator invalidation. This way listeners can safely remove themselves.
-            std::vector<ListenerHandle> handles;
-            handles.reserve(listeners.size());
-            for (auto &[handle, listener]: listeners) {
-                handles.push_back(handle);
-            }
-
-            for(auto& handle: handles) {
-                const auto& handleAndListener = listeners.find(handle);
-                const bool isListenerPresent = handleAndListener != listeners.end();
-                if (isListenerPresent && !isScheduledForRemoval(handle)) {
-                    const auto& listener = handleAndListener->second;
-                    listener(&msg);
+            auto it = listenersByType.find(std::type_index(typeid(T)));
+            if (it == listenersByType.end()) return;
+            auto listenersCopy = it->second;
+            for (const auto &entry : listenersCopy) {
+                if (listenersScheduledForRemoval.find(entry.handle) == listenersScheduledForRemoval.end()) {
+                    entry.callback(&msg);
                 }
             }
         }
 
         template<typename T>
         void queue(const T &msg) {
-            queuedDispatches.push_back([msg](Dispatcher& dispatcher) {
+            queuedDispatches.push_back([msg](Dispatcher &dispatcher) {
                 dispatcher.dispatch(msg);
             });
         }
 
         void process() {
-            for (auto &queuedDispatch: queuedDispatches) {
+            for (auto &queuedDispatch : queuedDispatches) {
                 queuedDispatch(*this);
             }
             queuedDispatches.clear();
         }
 
         void remove(const std::uint64_t handle) {
-            if (isScheduledForRemoval(handle)) {
-                return;
-            }
-
-            for (auto &listeners: listenersByType) {
-                listeners.second.erase(handle);
+            if (listenersScheduledForRemoval.find(handle) != listenersScheduledForRemoval.end()) return;
+            for (auto &listenersPair : listenersByType) {
+                auto &vec = listenersPair.second;
+                vec.erase(std::remove_if(vec.begin(), vec.end(), [handle](const ListenerEntry &entry) {
+                    return entry.handle == handle;
+                }), vec.end());
             }
         }
 
         [[nodiscard]] bool hasListener(std::uint64_t handle) const {
-            if (isScheduledForRemoval(handle)) {
-                return false;
+            if (listenersScheduledForRemoval.find(handle) != listenersScheduledForRemoval.end()) return false;
+            for (const auto &listenersPair : listenersByType) {
+                const auto &vec = listenersPair.second;
+                if (std::any_of(vec.begin(), vec.end(), [handle](const ListenerEntry &entry) {
+                        return entry.handle == handle;
+                    }))
+                    return true;
             }
-
-            return std::any_of(listenersByType.begin(), listenersByType.end(), [&handle](const auto& listeners) {
-                return listeners.second.find(handle) != listeners.second.end();
-            });
+            return false;
         }
 
     private:
-        [[nodiscard]] bool isScheduledForRemoval(const std::uint64_t handle) const {
-            return listenersScheduledForRemoval.find(handle) != listenersScheduledForRemoval.end();
-        }
+        struct ListenerEntry {
+            std::uint64_t handle;
+            int priority;
+            std::function<void(const void*)> callback;
+        };
 
-        std::map<std::type_index, Listeners> listenersByType;
+        std::map<std::type_index, std::vector<ListenerEntry>> listenersByType;
         std::list<std::function<void(Dispatcher&)>> queuedDispatches;
-        std::set<ListenerHandle> listenersScheduledForRemoval;
-
+        std::set<std::uint64_t> listenersScheduledForRemoval;
         std::uint64_t nextListenerId = 0;
     };
 
-    // RAII wrapper for listener handle.
     class Token {
     public:
-        Token(Dispatcher& dispatcher, const std::uint64_t handle)
+        Token(Dispatcher &dispatcher, const std::uint64_t handle)
             : dispatcher(dispatcher), _handle(handle), holdsResource(true) {}
         ~Token() {
             if (holdsResource) {
                 dispatcher.get().remove(_handle);
             }
         }
-
-        // Disable copy operations
-        Token(const Token&) = delete;
-        Token& operator=(const Token&) = delete;
-
-        // Enable move operations
-        Token(Token&& other) noexcept
+        Token(const Token &) = delete;
+        Token &operator=(const Token &) = delete;
+        Token(Token &&other) noexcept
             : dispatcher(other.dispatcher), _handle(other._handle), holdsResource(other.holdsResource) {
             other.holdsResource = false;
         }
-
-        Token& operator=(Token&& other) noexcept {
+        Token &operator=(Token &&other) noexcept {
             if (this != &other) {
-                if (this->holdsResource) {
+                if (holdsResource) {
                     dispatcher.get().remove(_handle);
                 }
                 dispatcher = other.dispatcher;
@@ -149,19 +138,16 @@ namespace tinyevents
             }
             return *this;
         }
-
         [[nodiscard]] std::uint64_t handle() const {
             return _handle;
         }
-
         void remove() {
             dispatcher.get().remove(_handle);
             holdsResource = false;
         }
-
     private:
         std::reference_wrapper<Dispatcher> dispatcher;
         std::uint64_t _handle;
         bool holdsResource;
     };
-}// namespace tinyevents
+}
