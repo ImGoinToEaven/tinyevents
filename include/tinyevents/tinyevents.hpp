@@ -9,7 +9,6 @@
 #include <utility>
 #include <algorithm>
 #include <cstdint>
-#include <algorithm>
 
 namespace tinyevents
 {
@@ -24,19 +23,17 @@ namespace tinyevents
 
         template<typename T>
         std::uint64_t listen(const std::function<void(const T &)> &listener, int priority = 0) {
-            auto &listeners = listenersByType[std::type_index(typeid(T))];
-            const auto listenerHandle = nextListenerId++;
-            ListenerEntry entry;
-            entry.handle = listenerHandle;
-            entry.priority = priority;
-            entry.callback = [listener](const void *msg) {
-                listener(*static_cast<const T *>(msg));
-            };
-            auto it = std::find_if(listeners.begin(), listeners.end(), [priority](const ListenerEntry &e) {
-                return e.priority < priority;
-            });
-            listeners.insert(it, entry);
-            return listenerHandle;
+            return addListener<T>(listener, priority);
+        }
+
+        template<typename T, typename C>
+        std::uint64_t listen(void (C::*memberFunc)(const T &), C *instance, int priority = 0) {
+            return addListener<T>(
+                [instance, memberFunc](const T &msg) {
+                    std::invoke(memberFunc, instance, msg);
+                },
+                priority
+            );
         }
 
         template<typename T>
@@ -48,6 +45,20 @@ namespace tinyevents
                 listenersScheduledForRemoval.erase(listenerId);
                 this->remove(listenerId);
             }, priority);
+        }
+
+        template<typename T, typename C>
+        std::uint64_t listenOnce(void (C::*memberFunc)(const T &), C *instance, int priority = 0) {
+            const auto listenerId = nextListenerId;
+            return listen<T>(
+                [this, listenerId, instance, memberFunc](const T &msg) {
+                    listenersScheduledForRemoval.insert(listenerId);
+                    std::invoke(memberFunc, instance, msg);
+                    listenersScheduledForRemoval.erase(listenerId);
+                    this->remove(listenerId);
+                },
+                priority
+            );
         }
 
         template<typename T>
@@ -104,6 +115,23 @@ namespace tinyevents
             int priority;
             std::function<void(const void*)> callback;
         };
+
+        template<typename T>
+        std::uint64_t addListener(const std::function<void(const T &)> &listener, int priority) {
+            auto &listeners = listenersByType[std::type_index(typeid(T))];
+            const auto listenerHandle = nextListenerId++;
+            ListenerEntry entry;
+            entry.handle = listenerHandle;
+            entry.priority = priority;
+            entry.callback = [listener](const void *msg) {
+                listener(*static_cast<const T *>(msg));
+            };
+            auto it = std::find_if(listeners.begin(), listeners.end(), [priority](const ListenerEntry &e) {
+                return e.priority < priority;
+            });
+            listeners.insert(it, entry);
+            return listenerHandle;
+        }
 
         std::map<std::type_index, std::vector<ListenerEntry>> listenersByType;
         std::list<std::function<void(Dispatcher&)>> queuedDispatches;
